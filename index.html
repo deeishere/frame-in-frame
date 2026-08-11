@@ -1,398 +1,357 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Frame in Frame</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+"""
+Frame in Frame — hand-tracked live effect (OpenCV + MediaPipe)
+================================================================
 
-    body {
-      font-family: 'Outfit', sans-serif;
-      background: #D1FFBD;
-      background-image:
-        radial-gradient(circle at 20% 20%, rgba(255,255,255,0.45) 0%, transparent 50%),
-        radial-gradient(circle at 80% 80%, rgba(90,158,58,0.12) 0%, transparent 45%);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 2rem 1.25rem 2.5rem;
-      color: #142410;
-    }
+Make a rectangle with both hands (thumb + index finger of each hand) and
+whatever inner clip/image you point this at gets composited live inside
+that hand-frame, on top of your webcam feed. Spread your hands wide enough
+and it crossfades to fill the whole screen — a built-in "reveal" transition.
 
-    .app {
-      width: 100%;
-      max-width: 900px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 1.5rem;
-    }
+INSTALL
+-------
+    pip install opencv-python mediapipe numpy
 
-    header {
-      text-align: center;
-    }
+RUN
+---
+    python hand_frame_in_frame.py                       # placeholder pattern inside the frame
+    python hand_frame_in_frame.py --inner clip.mp4       # video inside the frame
+    python hand_frame_in_frame.py --inner photo.jpg      # image inside the frame
+    python hand_frame_in_frame.py --camera 1             # use a different webcam
+    python hand_frame_in_frame.py --no-mirror            # don't mirror the feed
 
-    h1 {
-      font-family: 'Syne', sans-serif;
-      font-size: clamp(1.75rem, 5vw, 2.5rem);
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      line-height: 1.1;
-      color: #0f1a0c;
-    }
+CONTROLS (while the window is focused)
+---------------------------------------
+    q        quit
+    s        save a snapshot of the current composited frame (PNG)
+    m        toggle manual mode (drag 4 corner dots with the mouse instead
+             of using your hands — also the automatic fallback if MediaPipe
+             can't find hands well in your lighting/camera)
+    r        reset manual corner positions
+"""
 
-    h1 span {
-      display: block;
-      font-family: 'Outfit', sans-serif;
-      font-size: 0.42em;
-      font-weight: 300;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: #3d6b2e;
-      margin-bottom: 0.35rem;
-    }
+import argparse
+import time
+import os
+from datetime import datetime
 
-    .stage {
-      width: 100%;
-      border-radius: 20px;
-      overflow: hidden;
-      background: #0a0a0a;
-      box-shadow:
-        0 2px 4px rgba(15, 26, 12, 0.06),
-        0 24px 48px rgba(15, 26, 12, 0.14);
-      border: 1px solid rgba(255, 255, 255, 0.6);
-    }
+import cv2
+import numpy as np
+import mediapipe as mp
 
-    #output {
-      display: block;
-      width: 100%;
-      height: auto;
-      vertical-align: middle;
-    }
 
-    video, #innerVideo { display: none; }
+# --------------------------------------------------------------------------
+# Geometry helpers
+# --------------------------------------------------------------------------
 
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 0.65rem;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
+def sort_as_polygon(points):
+    """Order 4 points into a simple (non-self-intersecting) polygon by
+    sweeping angle around their centroid."""
+    pts = np.array(points, dtype=np.float32)
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+    order = np.argsort(angles)
+    return pts[order]
 
-    button {
-      font-family: 'Outfit', sans-serif;
-      padding: 0.7rem 1.5rem;
-      border: none;
-      border-radius: 999px;
-      background: #0f1a0c;
-      color: #D1FFBD;
-      font-size: 0.9rem;
-      font-weight: 500;
-      letter-spacing: 0.02em;
-      cursor: pointer;
-      transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
-      box-shadow: 0 4px 14px rgba(15, 26, 12, 0.2);
-    }
 
-    button:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 20px rgba(15, 26, 12, 0.28);
-      background: #1a2e14;
-    }
+def lerp_polygon(prev, target, t):
+    """Smooth prev -> target, matching point i to point i (both already
+    sorted the same way) to avoid corner-swap jitter."""
+    return prev + (target - prev) * t
 
-    button:active { transform: translateY(0); }
 
-    button.delete {
-      background: transparent;
-      color: #5a3030;
-      border: 1.5px solid rgba(90, 48, 48, 0.35);
-      box-shadow: none;
-    }
+def polygon_area(pts):
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
 
-    button.delete:hover {
-      background: rgba(255, 255, 255, 0.5);
-      box-shadow: none;
-    }
 
-    .status {
-      font-size: 0.78rem;
-      font-weight: 300;
-      letter-spacing: 0.04em;
-      color: #3d6b2e;
-      min-height: 1.2em;
-      opacity: 0;
-      transition: opacity 0.3s;
-    }
+def cover_crop_resize(src, target_w, target_h):
+    """Resize+crop src to exactly fill (target_w, target_h), like CSS
+    object-fit: cover."""
+    src_h, src_w = src.shape[:2]
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = int(np.ceil(src_w * scale)), int(np.ceil(src_h * scale))
+    resized = cv2.resize(src, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    x0 = (new_w - target_w) // 2
+    y0 = (new_h - target_h) // 2
+    return resized[y0:y0 + target_h, x0:x0 + target_w]
 
-    .status.visible { opacity: 1; }
-  </style>
-</head>
-<body>
-  <div class="app">
-    <header>
-      <h1><span>Welcome to</span>Frame in Frame!</h1>
-    </header>
 
-    <div class="stage">
-      <canvas id="output" width="1280" height="720"></canvas>
-    </div>
+def placeholder_tile(w, h, t):
+    """Generated diagonal-stripe placeholder used when no --inner file is
+    given, so the effect is visible out of the box."""
+    tile = np.zeros((h, w, 3), dtype=np.uint8)
+    tile[:] = (18, 16, 16)  # BGR near-black
+    stripe_w = 18
+    shift = int(t * 40) % (stripe_w * 2)
+    for x in range(-h - shift, w, stripe_w * 2):
+        pts = np.array([
+            [x, h], [x + h, 0], [x + h + stripe_w, 0], [x + stripe_w, h]
+        ], dtype=np.int32)
+        cv2.fillConvexPoly(tile, pts, (196, 224, 82))  # BGR teal-ish
+    overlay = tile.copy()
+    cv2.addWeighted(overlay, 0.18, np.zeros_like(tile), 0.82, 0, tile)
+    return tile
 
-    <div class="controls">
-      <button type="button" id="btnUpload">Upload</button>
-      <button type="button" id="btnDelete" class="delete">Delete</button>
-      <input type="file" id="fileInput" accept="image/*,video/*" hidden />
-    </div>
 
-    <p class="status" id="status"></p>
-  </div>
+# --------------------------------------------------------------------------
+# Inner content source (image or looping video)
+# --------------------------------------------------------------------------
 
-  <video id="webcam" playsinline></video>
-  <video id="innerVideo" playsinline loop muted></video>
-  <img id="innerImage" alt="" hidden />
+class InnerSource:
+    def __init__(self, path):
+        self.kind = None
+        self.image = None
+        self.cap = None
+        if path is None:
+            self.kind = "placeholder"
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            img = cv2.imread(path)
+            if img is None:
+                raise FileNotFoundError(f"Could not read image: {path}")
+            self.image = img
+            self.kind = "image"
+        else:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise FileNotFoundError(f"Could not open video: {path}")
+            self.cap = cap
+            self.kind = "video"
 
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+    def get_frame(self, w, h, t):
+        if self.kind == "image":
+            return cover_crop_resize(self.image, w, h)
+        if self.kind == "video":
+            ok, frame = self.cap.read()
+            if not ok:  # loop
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.cap.read()
+                if not ok:
+                    return placeholder_tile(w, h, t)
+            return cover_crop_resize(frame, w, h)
+        return placeholder_tile(w, h, t)
 
-  <script>
-    const canvas = document.getElementById('output');
-    const ctx = canvas.getContext('2d');
-    const webcam = document.getElementById('webcam');
-    const innerVideo = document.getElementById('innerVideo');
-    const innerImage = document.getElementById('innerImage');
-    const fileInput = document.getElementById('fileInput');
-    const statusEl = document.getElementById('status');
 
-    const W = canvas.width;
-    const H = canvas.height;
+# --------------------------------------------------------------------------
+# Manual mode (mouse-dragged corners) — also the automatic fallback
+# --------------------------------------------------------------------------
 
-    let innerKind = 'placeholder'; // placeholder | image | video
-    let smoothed = null;
-    let t0 = performance.now();
+class ManualCorners:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.points = self._default()
+        self.dragging = -1
 
-    // --- geometry helpers (mirror ui1.py) ---
+    def _default(self):
+        w, h = self.w, self.h
+        return np.array([
+            [w * 0.28, h * 0.30],
+            [w * 0.72, h * 0.30],
+            [w * 0.72, h * 0.72],
+            [w * 0.28, h * 0.72],
+        ], dtype=np.float32)
 
-    function lerpPolygon(prev, target, t) {
-      return prev.map((p, i) => [
-        p[0] + (target[i][0] - p[0]) * t,
-        p[1] + (target[i][1] - p[1]) * t,
-      ]);
-    }
+    def reset(self):
+        self.points = self._default()
 
-    function polygonArea(pts) {
-      let area = 0;
-      for (let i = 0; i < pts.length; i++) {
-        const j = (i + 1) % pts.length;
-        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
-      }
-      return Math.abs(area) / 2;
-    }
+    def mouse_cb(self, event, x, y, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dists = np.linalg.norm(self.points - np.array([x, y]), axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] < 35:
+                self.dragging = idx
+        elif event == cv2.EVENT_MOUSEMOVE and self.dragging >= 0:
+            self.points[self.dragging] = [x, y]
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.dragging = -1
 
-    function coverCrop(source, tw, th) {
-      const off = document.createElement('canvas');
-      off.width = tw;
-      off.height = th;
-      const octx = off.getContext('2d');
-      const sw = source.videoWidth || source.naturalWidth || source.width;
-      const sh = source.videoHeight || source.naturalHeight || source.height;
-      if (!sw || !sh) return off;
-      const scale = Math.max(tw / sw, th / sh);
-      const nw = Math.ceil(sw * scale);
-      const nh = Math.ceil(sh * scale);
-      const x0 = (nw - tw) / 2;
-      const y0 = (nh - th) / 2;
-      octx.drawImage(source, -x0, -y0, nw, nh);
-      return off;
-    }
 
-    function placeholderTile(w, h, t) {
-      const off = document.createElement('canvas');
-      off.width = w;
-      off.height = h;
-      const octx = off.getContext('2d');
-      octx.fillStyle = '#101010';
-      octx.fillRect(0, 0, w, h);
-      const stripeW = 18;
-      const shift = (Math.floor(t * 40) % (stripeW * 2));
-      octx.fillStyle = '#52e0c4';
-      for (let x = -h - shift; x < w; x += stripeW * 2) {
-        octx.beginPath();
-        octx.moveTo(x, h);
-        octx.lineTo(x + h, 0);
-        octx.lineTo(x + h + stripeW, 0);
-        octx.lineTo(x + stripeW, h);
-        octx.closePath();
-        octx.fill();
-      }
-      octx.globalAlpha = 0.18;
-      octx.fillStyle = '#52e0c4';
-      octx.fillRect(0, 0, w, h);
-      return off;
-    }
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
-    function getInnerFrame(w, h, t) {
-      if (innerKind === 'image' && innerImage.complete && innerImage.naturalWidth) {
-        return coverCrop(innerImage, w, h);
-      }
-      if (innerKind === 'video' && innerVideo.readyState >= 2) {
-        return coverCrop(innerVideo, w, h);
-      }
-      return placeholderTile(w, h, t);
-    }
+def main():
+    parser = argparse.ArgumentParser(description="Hand-tracked frame-in-frame effect")
+    parser.add_argument("--inner", type=str, default=None,
+                         help="Path to an image or video to show inside the hand frame")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index")
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--reveal-start", type=float, default=0.12,
+                         help="Frame-area ratio (0-1) at which the crossfade starts kicking in")
+    parser.add_argument("--reveal-threshold", type=float, default=0.55,
+                         help="Frame-area ratio (0-1) at which the inner content fully takes over the screen")
+    parser.add_argument("--no-mirror", action="store_true", help="Don't mirror the webcam feed")
+    args = parser.parse_args()
 
-    // --- inner content upload / delete ---
+    mirror = not args.no_mirror
 
-    function uploadInnerFile(file) {
-      if (!file) return;
-      const url = URL.createObjectURL(file);
-      if (file.type.startsWith('video/')) {
-        innerKind = 'video';
-        innerVideo.src = url;
-        innerVideo.play().catch(() => {});
-        innerImage.removeAttribute('src');
-        setStatus(file.name);
-      } else if (file.type.startsWith('image/')) {
-        innerKind = 'image';
-        innerImage.onload = () => setStatus(file.name);
-        innerImage.src = url;
-        innerVideo.removeAttribute('src');
-      } else {
-        setStatus('Unsupported file');
-      }
-    }
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(
+        max_num_hands=2,
+        model_complexity=1,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.5,
+    )
 
-    function deleteInnerContent() {
-      innerKind = 'placeholder';
-      innerImage.removeAttribute('src');
-      innerVideo.pause();
-      innerVideo.removeAttribute('src');
-      fileInput.value = '';
-      setStatus('');
-    }
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {args.camera}")
 
-    function setStatus(msg) {
-      statusEl.textContent = msg;
-      statusEl.classList.toggle('visible', !!msg);
-    }
+    ok, frame = cap.read()
+    if not ok:
+        raise RuntimeError("Could not read from camera")
+    h, w = frame.shape[:2]
 
-    document.getElementById('btnUpload').addEventListener('click', () => fileInput.click());
-    document.getElementById('btnDelete').addEventListener('click', deleteInnerContent);
-    fileInput.addEventListener('change', (e) => uploadInnerFile(e.target.files[0]));
+    inner = InnerSource(args.inner)
+    manual = ManualCorners(w, h)
 
-    // --- compositing ---
+    window = "Frame in Frame"
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, manual.mouse_cb)
 
-    function drawPolygonMask(points) {
-      ctx.beginPath();
-      ctx.moveTo(points[0][0], points[0][1]);
-      for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
-      ctx.closePath();
-    }
+    manual_mode = False
+    smoothed = None
+    reveal_progress = 0.0
+    t0 = time.time()
 
-    function compositeFrame(poly, t) {
-      const xs = poly.map(p => p[0]);
-      const ys = poly.map(p => p[1]);
-      const x0 = Math.max(0, Math.floor(Math.min(...xs)));
-      const y0 = Math.max(0, Math.floor(Math.min(...ys)));
-      const x1 = Math.min(W, Math.ceil(Math.max(...xs)));
-      const y1 = Math.min(H, Math.ceil(Math.max(...ys)));
-      const rw = Math.max(1, x1 - x0);
-      const rh = Math.max(1, y1 - y0);
+    print("Controls: q=quit  s=snapshot  m=toggle manual mode  r=reset manual corners")
 
-      const innerPatch = getInnerFrame(rw, rh, t);
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if mirror:
+            frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        t = time.time() - t0
 
-      ctx.save();
-      drawPolygonMask(poly);
-      ctx.clip();
-      ctx.drawImage(innerPatch, x0, y0, rw, rh);
-      ctx.restore();
+        target_points = None
 
-      ctx.strokeStyle = '#52e0c4';
-      ctx.lineWidth = 2;
-      drawPolygonMask(poly);
-      ctx.stroke();
-      poly.forEach(p => {
-        ctx.beginPath();
-        ctx.arc(p[0], p[1], 6, 0, Math.PI * 2);
-        ctx.fillStyle = '#52e0c4';
-        ctx.fill();
-      });
+        if manual_mode:
+            target_points = manual.points
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb)
+            hand_pts = {}
+            if results.multi_hand_landmarks and results.multi_handedness:
+                for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                                       results.multi_handedness):
+                    # MediaPipe's handedness label assumes a mirrored
+                    # (selfie-view) input image. If we're not mirroring,
+                    # the label is backwards relative to the user, so flip it.
+                    label = handedness.classification[0].label
+                    if not mirror:
+                        label = "Right" if label == "Left" else "Left"
+                    thumb = hand_landmarks.landmark[4]
+                    index = hand_landmarks.landmark[8]
+                    hand_pts[label] = {
+                        "thumb": [thumb.x * w, thumb.y * h],
+                        "index": [index.x * w, index.y * h],
+                    }
+            if "Left" in hand_pts and "Right" in hand_pts:
+                # Fixed corner roles (regardless of hand rotation):
+                #   top-left = left index, top-right = right index
+                #   bottom-right = right thumb, bottom-left = left thumb
+                target_points = np.array([
+                    hand_pts["Left"]["index"],
+                    hand_pts["Right"]["index"],
+                    hand_pts["Right"]["thumb"],
+                    hand_pts["Left"]["thumb"],
+                ], dtype=np.float32)
 
-      const ratio = polygonArea(poly) / (W * H);
-      return ratio;
-    }
+        if target_points is not None:
+            target_sorted = np.array(target_points, dtype=np.float32)
+            if smoothed is None:
+                smoothed = target_sorted
+            else:
+                # Corner roles are now fixed (by hand/fingertip identity), so
+                # points keep the same order every frame - no re-sorting needed.
+                t_lerp = 1.0 if manual_mode else 0.35
+                smoothed = lerp_polygon(smoothed, target_sorted, t_lerp)
+        elif not manual_mode:
+            smoothed = None  # release frame when hands drop out
 
-    function onResults(results) {
-      const t = (performance.now() - t0) / 1000;
+        output = frame.copy()
 
-      ctx.save();
-      ctx.scale(-1, 1);
-      ctx.drawImage(results.image, -W, 0, W, H);
-      ctx.restore();
+        if smoothed is not None:
+            poly = smoothed
+            poly_int = poly.astype(np.int32)
 
-      let targetPoints = null;
-      const handPts = {};
+            x0, y0, rect_w, rect_h = cv2.boundingRect(poly_int)
+            rect_w, rect_h = max(rect_w, 1), max(rect_h, 1)
+            x0 = max(x0, 0)
+            y0 = max(y0, 0)
+            x1 = min(x0 + rect_w, w)
+            y1 = min(y0 + rect_h, h)
 
-      if (results.multiHandLandmarks && results.multiHandedness) {
-        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
-          const lm = results.multiHandLandmarks[i];
-          const label = results.multiHandedness[i].label;
-          handPts[label] = {
-            thumb: [(1 - lm[4].x) * W, lm[4].y * H],
-            index: [(1 - lm[8].x) * W, lm[8].y * H],
-          };
-        }
-      }
+            inner_patch = inner.get_frame(x1 - x0, y1 - y0, t)
 
-      if (handPts.Left && handPts.Right) {
-        targetPoints = [
-          handPts.Left.index,
-          handPts.Right.index,
-          handPts.Right.thumb,
-          handPts.Left.thumb,
-        ];
-      }
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, poly_int, 255)
 
-      if (targetPoints) {
-        if (!smoothed) smoothed = targetPoints;
-        else smoothed = lerpPolygon(smoothed, targetPoints, 0.35);
-        compositeFrame(smoothed, t);
-        setStatus('');
-      } else {
-        smoothed = null;
-      }
-    }
+            canvas = frame.copy()
+            canvas[y0:y1, x0:x1] = inner_patch
+            mask_3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            output = np.where(mask_3 == 255, canvas, output)
 
-    // --- MediaPipe setup ---
+            # viewfinder overlay: dashed polygon + corner dots
+            cv2.polylines(output, [poly_int], isClosed=True, color=(196, 224, 82), thickness=2)
+            for p in poly_int:
+                cv2.circle(output, tuple(p), 6, (196, 224, 82), -1)
 
-    const hands = new Hands({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
-    });
+            area = polygon_area(poly)
+            ratio = area / (w * h)
+            # Continuous crossfade: fully driven by how wide you spread the
+            # frame, so how much of the screen the inner content takes over
+            # is entirely up to you, not a hard on/off snap.
+            span = max(args.reveal_threshold - args.reveal_start, 1e-6)
+            target_reveal = np.clip((ratio - args.reveal_start) / span, 0.0, 1.0)
+            reveal_progress += (target_reveal - reveal_progress) * 0.15
 
-    hands.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.5,
-    });
+            if reveal_progress > 0.01:
+                full_inner = inner.get_frame(w, h, t)
+                output = cv2.addWeighted(full_inner, reveal_progress, output, 1 - reveal_progress, 0)
 
-    hands.onResults(onResults);
+            hud = f"{'MANUAL' if manual_mode else 'TRACK'}  FRAME {ratio*100:4.0f}%"
+            if reveal_progress > 0.02:
+                hud += f"  REVEAL {reveal_progress*100:3.0f}%"
+            cv2.putText(output, hud, (12, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (196, 224, 82), 1, cv2.LINE_AA)
+        else:
+            reveal_progress *= 0.9
+            msg = "Show both hands (thumb + index touching) to open a frame"
+            if manual_mode:
+                msg = "Drag the four dots to shape your frame"
+            cv2.putText(output, msg, (12, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (150, 150, 150), 1, cv2.LINE_AA)
 
-    const camera = new Camera(webcam, {
-      onFrame: async () => {
-        await hands.send({ image: webcam });
-      },
-      width: W,
-      height: H,
-    });
+        cv2.putText(output, "Frame in Frame", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (232, 230, 225), 1, cv2.LINE_AA)
 
-    camera.start()
-      .catch(() => setStatus('Camera blocked'));
-  </script>
-</body>
-</html>
+        cv2.imshow(window, output)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('m'):
+            manual_mode = not manual_mode
+            print("Manual mode:", manual_mode)
+        elif key == ord('r'):
+            manual.reset()
+        elif key == ord('s'):
+            fname = f"frame_in_frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            cv2.imwrite(fname, output)
+            print("Saved", fname)
+
+    cap.release()
+    if inner.cap is not None:
+        inner.cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
